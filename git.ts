@@ -344,39 +344,42 @@ export function readPack(pack: Buffer, lookup?: (id: string) => GitObject | unde
   return byId;
 }
 
-/** Advance `pos` past a zlib stream in `buf` (deflate streams have no length prefix). */
+/** Adler-32 checksum, as a zlib stream's last 4 bytes store it (big-endian). */
+function adler32(data: Buffer): number {
+  const MOD = 65521;
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + data[i]) % MOD;
+    b = (b + a) % MOD;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+/** Advance `pos` past a zlib stream in `buf` (deflate streams have no length prefix).
+ * Node's inflateSync stops at the stream end and ignores trailing bytes, so one
+ * inflate yields the data; the stream's end is where its trailing Adler-32 (of that
+ * data) sits, verified by re-inflating exactly that slice. Two inflates per object
+ * instead of a binary search's dozen — the push workload's hot path. */
 function skipZlib(buf: Buffer, pos: number): number {
-  // A zlib stream ends with an Adler-32 checksum; the reliable way to find its end is to
-  // inflate incrementally. Use a small chunked inflate via the sync API on growing slices
-  // is wasteful, so instead scan: try inflateSync on slices doubling in size is also bad.
-  // Practical approach: inflate with zlib's streaming API is async; here we use a trick —
-  // Node's inflateSync throws on trailing garbage only when the stream is truncated, and
-  // accepts trailing bytes silently? It does not. So binary-search the end instead.
-  let lo = pos;
-  let hi = buf.length;
-  // First, find any end by trying increasing lengths with a coarse step, then refine.
-  // zlib streams in packs are contiguous; the next object's header starts right after.
-  // Use inflateSync on candidate slices: it succeeds exactly when the slice ends at the
-  // stream boundary (extra bytes cause "incorrect data check" only if they corrupt the
-  // stream; trailing bytes are ignored by inflateSync? No — inflateSync requires the
-  // input to be exactly one stream... it actually stops at the stream end and ignores
-  // trailing data). Test: inflateSync(buf) on a longer slice returns the same output.
-  // So: inflate the whole remainder once to get the data, then find the minimal prefix
-  // that inflates to the same bytes by binary search.
-  const full = inflateSync(buf.subarray(pos));
-  let low = pos;
-  let high = buf.length;
-  while (low < high) {
-    const mid = Math.floor((low + high) / 2);
-    try {
-      const out = inflateSync(buf.subarray(pos, mid));
-      if (out.equals(full)) high = mid;
-      else low = mid + 1;
-    } catch {
-      low = mid + 1;
+  const data = inflateSync(buf.subarray(pos));
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(data), 0);
+  for (let end = pos + 7; end <= buf.length; end += 1) {
+    if (
+      buf[end - 4] === needle[0] &&
+      buf[end - 3] === needle[1] &&
+      buf[end - 2] === needle[2] &&
+      buf[end - 1] === needle[3]
+    ) {
+      try {
+        if (inflateSync(buf.subarray(pos, end)).equals(data)) return end;
+      } catch {
+        // Not the stream end (an Adler collision inside the deflate data): keep scanning.
+      }
     }
   }
-  return low;
+  throw new Error('zlib stream end not found');
 }
 
 // -------------------------------------------------------------------------------------------
