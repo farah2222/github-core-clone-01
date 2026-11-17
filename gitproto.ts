@@ -32,9 +32,9 @@ import {
 import {
   ancestors,
   collectDepthLimited,
+  collectHeld,
   isAncestor,
   readCommit,
-  reachableObjects,
 } from './gitops.ts';
 import { learnViewer, lookupRepo, type Ctx } from './rest.ts';
 import { ZERO_OID, type Repo, type Store } from './store.ts';
@@ -220,10 +220,11 @@ function computeFetch(
   } else {
     collected = collectDepthLimited(repo, args.wants, depth);
   }
-  // Exclude everything reachable from the haves, and from deepen-not refs.
+  // Exclude what the client already holds: the haves' closure, truncated at the
+  // client's shallow boundaries (a deepen fetch must still deliver past them).
   const excluded = new Set<string>();
   if (args.haves.length > 0) {
-    for (const id of reachableObjects(repo, args.haves).keys()) excluded.add(id);
+    for (const id of collectHeld(repo, args.haves, args.shallow).keys()) excluded.add(id);
   }
   for (const ref of args.deepenNot) {
     const tip = repo.refs.get(ref) ?? repo.refs.get(`refs/heads/${ref}`);

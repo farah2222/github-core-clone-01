@@ -177,7 +177,9 @@ export function makeCommit(
 ): string {
   const when = new Date();
   const id = identity(store, when);
-  const data = buildCommit(treeSha, parents, id, id, message.endsWith('\n') ? message : `${message}\n`);
+  // Store the message exactly as given: the REST checks compare commit.message
+  // byte-for-byte with the message they sent (no trailing newline added).
+  const data = buildCommit(treeSha, parents, id, id, message);
   return putObject(repo, 'commit', data);
 }
 
@@ -254,10 +256,22 @@ export function ancestors(repo: Repo, sha: string): Set<string> {
   return out;
 }
 
-/** True when `oldSha` is an ancestor of (or equal to) `newSha`. */
+/** True when `oldSha` is an ancestor of (or equal to) `newSha`.
+ * Early-exit search: a fast-forward check usually finds the old tip one hop away,
+ * so never build the whole ancestor set (that made chained pushes quadratic). */
 export function isAncestor(repo: Repo, oldSha: string, newSha: string): boolean {
   if (oldSha === newSha) return true;
-  return ancestors(repo, newSha).has(oldSha);
+  const seen = new Set<string>();
+  const stack = [newSha];
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    if (cur === ZERO_OID || seen.has(cur)) continue;
+    seen.add(cur);
+    if (cur === oldSha) return true;
+    const record = readCommit(repo, cur);
+    if (record) for (const p of record.parents) stack.push(p);
+  }
+  return false;
 }
 
 /** The merge-base of two commits: the first common ancestor found walking `b`'s history. */
@@ -474,6 +488,44 @@ export function collectDepthLimited(
 /** The full reachable closure of `roots` (depth unlimited). */
 export function reachableObjects(repo: Repo, roots: string[]): Map<string, { type: 'commit' | 'tree' | 'blob' | 'tag'; data: Buffer }> {
   return collectReachable(repo, roots, []);
+}
+
+/**
+ * The objects a fetching client already holds from `roots`: the reachable closure,
+ * except the walk never descends past a commit listed in `shallow` (the client holds
+ * that commit and its tree/blobs, but not its parents — that is what a shallow
+ * boundary means). This is the correct exclusion set for a fetch: subtracting the
+ * full closure would wrongly exclude the parent a deepen fetch is asking for.
+ */
+export function collectHeld(
+  repo: Repo,
+  roots: string[],
+  shallow: string[],
+): Map<string, { type: 'commit' | 'tree' | 'blob' | 'tag'; data: Buffer }> {
+  const stopAt = new Set(shallow);
+  const objects = new Map<string, { type: 'commit' | 'tree' | 'blob' | 'tag'; data: Buffer }>();
+  const queue = [...roots];
+  const seen = new Set<string>();
+  while (queue.length > 0) {
+    const sha = queue.shift()!;
+    if (seen.has(sha)) continue;
+    seen.add(sha);
+    const obj = getObject(repo, sha);
+    if (!obj) continue;
+    if (obj.type === 'tag') {
+      objects.set(sha, obj);
+      const m = obj.data.toString('utf8').match(/^object ([0-9a-f]{40})$/m);
+      if (m) queue.push(m[1]);
+      continue;
+    }
+    if (obj.type !== 'commit') continue;
+    const { objects: closure } = collectDepthLimited(repo, [sha], 1);
+    for (const [id, o] of closure) objects.set(id, o);
+    if (stopAt.has(sha)) continue;
+    const record = readCommit(repo, sha);
+    if (record) for (const p of record.parents) queue.push(p);
+  }
+  return objects;
 }
 
 /** SHA-1 of a blob's bytes, as git computes it (used for the contents API). */
